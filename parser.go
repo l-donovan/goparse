@@ -251,7 +251,7 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 				}
 
 				values[parameterConfig.Name] = arg
-				result, subparserErrors := subparser.parseArgs(args)
+				result, subparserErrors := subparser.parseArgs(p.args)
 
 				if len(subparserErrors) > 0 {
 					errors = append(errors, subparserErrors...)

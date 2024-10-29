@@ -3,7 +3,6 @@ package goparse
 import (
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 )
 
@@ -22,10 +21,15 @@ type ValueFlagConfig struct {
 	Default     string
 }
 
+type ParameterOption struct {
+	Name   string
+	Hidden bool
+}
+
 type ParameterConfig struct {
 	Name        string
 	Description string
-	Options     []string
+	Options     []ParameterOption
 	MinCount    int
 }
 
@@ -37,6 +41,7 @@ type Parser struct {
 	listParameter     *ParameterConfig
 	subparserArgument string
 	subparsers        map[string]Parser
+	hidden            bool
 }
 
 func NewParser() Parser {
@@ -74,13 +79,13 @@ func (p *Parser) AddParameter(name string, description string) {
 	c := ParameterConfig{
 		Name:        name,
 		Description: description,
-		Options:     []string{},
+		Options:     []ParameterOption{},
 	}
 
 	p.parameterArgs = append(p.parameterArgs, c)
 }
 
-func (p *Parser) AddChoiceParameter(name string, description string, options []string) {
+func (p *Parser) AddChoiceParameter(name string, description string, options []ParameterOption) {
 	c := ParameterConfig{
 		Name:        name,
 		Description: description,
@@ -98,7 +103,7 @@ func (p *Parser) AddListParameter(name string, description string, min int) erro
 	c := ParameterConfig{
 		Name:        name,
 		Description: description,
-		Options:     []string{},
+		Options:     []ParameterOption{},
 		MinCount:    min,
 	}
 
@@ -110,13 +115,22 @@ func (p *Parser) AddListParameter(name string, description string, min int) erro
 func (p *Parser) Subparse(name string, description string, subparserMap SubparserMap) {
 	p.subparserArgument = name
 	p.subparsers = map[string]Parser{}
-	options := []string{}
+	var options []ParameterOption
 
 	for subparserName, initSubparser := range subparserMap {
+		option := ParameterOption{
+			Name: subparserName,
+		}
+
+		if option.Name[0] == '_' {
+			option.Hidden = true
+			option.Name = option.Name[1:]
+		}
+
 		subparser := NewParser()
 		initSubparser(&subparser)
-		p.subparsers[subparserName] = subparser
-		options = append(options, subparserName)
+		p.subparsers[option.Name] = subparser
+		options = append(options, option)
 	}
 
 	p.AddChoiceParameter(name, description, options)
@@ -136,9 +150,9 @@ func (p *Parser) popArg() (string, bool) {
 func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 	values := map[string]interface{}{}
 	hasListParameterArg := p.listParameter != nil
-	listValues := []string{}
+	var listValues []string
 	currentArgPos := 0
-	errors := []error{}
+	var errors []error
 	p.args = args
 
 	// Set defaults
@@ -264,8 +278,11 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 				return values, errors
 			}
 
-			if len(parameterConfig.Options) > 0 && !slices.Contains(parameterConfig.Options, arg) {
-				errors = append(errors, fmt.Errorf("bad argument \"%s\" for parameter `%s'", arg, parameterConfig.Name))
+			for _, option := range parameterConfig.Options {
+				if option.Name == arg {
+					errors = append(errors, fmt.Errorf("bad argument \"%s\" for parameter `%s'", arg, parameterConfig.Name))
+					break
+				}
 			}
 
 			values[parameterConfig.Name] = arg
@@ -273,7 +290,7 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 		} else if hasListParameterArg {
 			listValues = append(listValues, arg)
 		} else {
-			errors = append(errors, fmt.Errorf("Yikes!"))
+			errors = append(errors, fmt.Errorf("yikes"))
 		}
 	}
 
@@ -289,7 +306,7 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 
 	// Determine if any args are missing
 
-	missingArgNames := []string{}
+	var missingArgNames []string
 
 	for i := currentArgPos; i < len(p.parameterArgs); i++ {
 		missingArgNames = append(missingArgNames, p.parameterArgs[i].Name)
@@ -326,7 +343,7 @@ func (p *Parser) ParseArgs() (map[string]interface{}, []error) {
 
 func (p *Parser) MustParseArgs() map[string]interface{} {
 	osArgs := os.Args[1:]
-	args, errors := p.parseArgs(osArgs)
+	args, errs := p.parseArgs(osArgs)
 
 	if _, ok := args["help"]; ok {
 		subparserArg, found := args[p.subparserArgument]
@@ -340,7 +357,7 @@ func (p *Parser) MustParseArgs() map[string]interface{} {
 		os.Exit(0)
 	}
 
-	if len(errors) > 0 {
+	if len(errs) > 0 {
 		subparserArg, found := args[p.subparserArgument]
 
 		if found {
@@ -349,10 +366,10 @@ func (p *Parser) MustParseArgs() map[string]interface{} {
 			p.printUsage("")
 		}
 
-		fmt.Fprintln(os.Stderr, "\nencountered errors when parsing arguments:")
+		_, _ = fmt.Fprintln(os.Stderr, "\nencountered errors when parsing arguments:")
 
-		for _, error := range errors {
-			fmt.Fprintf(os.Stderr, " %s\n", error)
+		for _, err := range errs {
+			_, _ = fmt.Fprintf(os.Stderr, " %s\n", err)
 		}
 
 		os.Exit(1)
@@ -404,8 +421,8 @@ func (p *Parser) getFlagDescriptions(subparserArg string) string {
 	}
 
 	usage := ""
-	prefixes := []string{}
-	descriptions := []string{}
+	var prefixes []string
+	var descriptions []string
 	maxPrefixLen := 0
 
 	for _, valueFlagArg := range p.valueFlagArgs {
@@ -446,8 +463,8 @@ func (p *Parser) getParameterDescriptions(subparserArg string) string {
 	}
 
 	usage := ""
-	prefixes := []string{}
-	descriptions := []string{}
+	var prefixes []string
+	var descriptions []string
 	maxPrefixLen := 0
 
 	for _, parameter := range p.parameterArgs {
@@ -493,14 +510,16 @@ func (p *Parser) getParameterOptions(subparserArg string) []string {
 		return subparser.getParameterOptions("")
 	}
 
-	options := []string{}
+	var options []string
 
 	for _, parameter := range p.parameterArgs {
-		if len(parameter.Options) > 0 && (parameter.Name != p.subparserArgument || subparserArg == "") {
+		if len(parameter.Options) > 0 {
 			optionString := fmt.Sprintf("\noptions for parameter `%s':", parameter.Name)
 
 			for _, option := range parameter.Options {
-				optionString += "\n " + option
+				if !option.Hidden {
+					optionString += "\n " + option.Name
+				}
 			}
 
 			options = append(options, optionString)
@@ -534,5 +553,5 @@ func (p *Parser) printUsage(subparserArg string) {
 		usage += "\n" + optionDescription
 	}
 
-	fmt.Fprintf(os.Stderr, "%s\n", usage)
+	_, _ = fmt.Fprintln(os.Stderr, usage)
 }

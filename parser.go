@@ -4,44 +4,45 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"al.essio.dev/pkg/shellescape"
 )
 
-type FlagConfig struct {
-	LongName     string
-	ShortName    rune
-	Description  string
-	SetByDefault bool
+type flagParam struct {
+	longName     string
+	shortName    rune
+	description  string
+	setByDefault bool
 }
 
-type ValueFlagConfig struct {
-	LongName    string
-	ShortName   rune
-	Description string
-	ValueName   string
-	Default     string
+type valueFlagParam struct {
+	longName     string
+	shortName    rune
+	description  string
+	valueName    string
+	defaultValue string
 }
 
-type ParameterOption struct {
-	Name   string
-	Hidden bool
+type paramOption struct {
+	name   string
+	hidden bool
 }
 
-type ParameterConfig struct {
-	Name        string
-	Description string
-	Options     []ParameterOption
-	MinCount    int
+type positionalParam struct {
+	name        string
+	description string
+	options     []paramOption
+	minCount    int
 }
 
 type Parser struct {
 	args              []string
-	flagArgs          []FlagConfig
-	valueFlagArgs     []ValueFlagConfig
-	parameterArgs     []ParameterConfig
-	listParameter     *ParameterConfig
+	flagParams        []flagParam
+	valueFlagParams   []valueFlagParam
+	positionalParams  []positionalParam
+	listParam         *positionalParam
 	subparserArgument string
 	subparsers        map[string]Parser
-	hidden            bool
 }
 
 func NewParser() Parser {
@@ -50,86 +51,257 @@ func NewParser() Parser {
 	return p
 }
 
-type SubparserMap map[string]func(parser *Parser)
+// SubparserMap is a map of parameter values to functions that accept a pointer to a Parser struct
+// in which subparser behavior can be configured.
+type SubparserMap map[string]func(subparser *Parser)
 
-func (p *Parser) AddFlag(longName string, shortName rune, description string, setByDefault bool) {
-	c := FlagConfig{
-		LongName:     longName,
-		ShortName:    shortName,
-		Description:  description,
-		SetByDefault: setByDefault,
+// marshal does the heavy lifting for Marshal, iterating through the positional, flag, value flag,
+// and list parameters in a parser to turn a map of input values into a command string.
+//
+// marshal differs from Marshal in that it does not parse the optional subparser argument.
+// This avoids endless recursion.
+func (p *Parser) marshal(values map[string]any) ([]string, error) {
+	var arguments []string
+
+	// Handle positional parameters.
+
+	for _, param := range p.positionalParams {
+		value, exists := values[param.name]
+
+		if !exists {
+			return nil, fmt.Errorf("missing required positional parameter `%s'", param.name)
+		}
+
+		val := fmt.Sprintf("%s", value)
+		arguments = append(arguments, shellescape.Quote(val))
 	}
 
-	p.flagArgs = append(p.flagArgs, c)
+	// Handle value flag parameters.
+
+	for _, param := range p.valueFlagParams {
+		value, exists := values[param.longName]
+
+		if exists {
+			val := fmt.Sprintf("%s", value)
+			arguments = append(arguments, "--"+param.longName, shellescape.Quote(val))
+		} else {
+			arguments = append(arguments, "--"+param.longName, shellescape.Quote(param.defaultValue))
+		}
+	}
+
+	// Handle flag parameters.
+
+	for _, param := range p.flagParams {
+		value, exists := values[param.longName]
+
+		if exists {
+			isSet, ok := value.(bool)
+
+			if !ok {
+				return nil, fmt.Errorf("expected value of type bool for flag parameter `%s' but found %T", param.longName, value)
+			}
+
+			if isSet {
+				arguments = append(arguments, "--"+param.longName)
+			}
+		} else if param.setByDefault {
+			arguments = append(arguments, "--"+param.longName)
+		}
+	}
+
+	// Handle the optional list parameter.
+
+	if p.listParam != nil {
+		value, exists := values[p.listParam.name]
+
+		if !exists && p.listParam.minCount > 0 {
+			return nil, fmt.Errorf("list parameter requires at least %d value(s) but found none", p.listParam.minCount)
+		}
+
+		switch val := value.(type) {
+		case []string:
+			if len(val) < p.listParam.minCount {
+				return nil, fmt.Errorf("list parameter requires at least %d value(s) but found %d", p.listParam.minCount, len(val))
+			}
+
+			valueStrings := make([]string, len(val))
+
+			for i, value := range val {
+				valueStrings[i] = shellescape.Quote(value)
+			}
+
+			arguments = append(arguments, valueStrings...)
+		case []any:
+			if len(val) < p.listParam.minCount {
+				return nil, fmt.Errorf("list parameter requires at least %d value(s) but found %d", p.listParam.minCount, len(val))
+			}
+
+			valueStrings := make([]string, len(val))
+
+			for i, value := range val {
+				valueStrings[i] = shellescape.Quote(fmt.Sprintf("%s", value))
+			}
+
+			arguments = append(arguments, valueStrings...)
+		default:
+			return nil, fmt.Errorf("expected value of type []any or []string for list parameter `%s' but found %T", p.listParam.name, value)
+		}
+	}
+
+	return arguments, nil
+}
+
+// Marshal turns a map of input values into a corresponding command string. It is the functional
+// inverse of ParseArgs, which turns a command string into a map of input values.
+func (p *Parser) Marshal(executable string, values map[string]any) (string, error) {
+	var subp *Parser
+	var arguments []string
+
+	// Check if the executable was provided.
+
+	if executable != "" {
+		arguments = append(arguments, executable)
+	}
+
+	// Check if we have a subparser.
+
+	if p.subparserArgument != "" {
+		subparserName, exists := values[p.subparserArgument]
+
+		if !exists {
+			return "", fmt.Errorf("subparser argument `%s' was not provided", p.subparserArgument)
+		}
+
+		subparser, exists := p.subparsers[subparserName.(string)]
+
+		if !exists {
+			return "", fmt.Errorf("subparser `%s' for argument `%s' does not exist", subparserName, p.subparserArgument)
+		}
+
+		subp = &subparser
+	}
+
+	// Marshal parser arguments.
+
+	args, err := p.marshal(values)
+
+	if err != nil {
+		return "", fmt.Errorf("marshal arguments: %w", err)
+	}
+
+	arguments = append(arguments, args...)
+
+	// Marshal subparser arguments.
+
+	if subp != nil {
+		args, err := subp.marshal(values)
+
+		if err != nil {
+			return "", fmt.Errorf("marshal subparser arguments: %w", err)
+		}
+
+		arguments = append(arguments, args...)
+	}
+
+	return strings.Join(arguments, " "), nil
+}
+
+func (p *Parser) AddFlag(longName string, shortName rune, description string, setByDefault bool) {
+	c := flagParam{
+		longName:     longName,
+		shortName:    shortName,
+		description:  description,
+		setByDefault: setByDefault,
+	}
+
+	p.flagParams = append(p.flagParams, c)
 }
 
 func (p *Parser) AddValueFlag(longName string, shortName rune, description string, valueName string, defaultValue string) {
-	c := ValueFlagConfig{
-		LongName:    longName,
-		ShortName:   shortName,
-		Description: description,
-		ValueName:   strings.ToUpper(valueName),
-		Default:     defaultValue,
+	c := valueFlagParam{
+		longName:     longName,
+		shortName:    shortName,
+		description:  description,
+		valueName:    strings.ToUpper(valueName),
+		defaultValue: defaultValue,
 	}
 
-	p.valueFlagArgs = append(p.valueFlagArgs, c)
+	p.valueFlagParams = append(p.valueFlagParams, c)
 }
 
 func (p *Parser) AddParameter(name string, description string) {
-	c := ParameterConfig{
-		Name:        name,
-		Description: description,
-		Options:     []ParameterOption{},
+	c := positionalParam{
+		name:        name,
+		description: description,
+		options:     []paramOption{},
 	}
 
-	p.parameterArgs = append(p.parameterArgs, c)
+	p.positionalParams = append(p.positionalParams, c)
 }
 
-func (p *Parser) AddChoiceParameter(name string, description string, options []ParameterOption) {
-	c := ParameterConfig{
-		Name:        name,
-		Description: description,
-		Options:     options,
+func (p *Parser) AddChoiceParameter(name string, description string, options []paramOption) {
+	c := positionalParam{
+		name:        name,
+		description: description,
+		options:     options,
 	}
 
-	p.parameterArgs = append(p.parameterArgs, c)
+	p.positionalParams = append(p.positionalParams, c)
 }
 
+// SetListParameter sets the list parameter on the parser.
+func (p *Parser) SetListParameter(name string, description string, min int) {
+	c := positionalParam{
+		name:        name,
+		description: description,
+		options:     []paramOption{},
+		minCount:    min,
+	}
+
+	p.listParam = &c
+}
+
+// AddListParameter adds a list parameter to the parser if one doesn't already exist.
+// If it does, an error is returned.
+//
+// Deprecated: Use SetListParameter instead to avoid unnecessary error handling.
 func (p *Parser) AddListParameter(name string, description string, min int) error {
-	if p.listParameter != nil {
+	if p.listParam != nil {
 		return fmt.Errorf("parsers support a maximum of one list parameter")
 	}
 
-	c := ParameterConfig{
-		Name:        name,
-		Description: description,
-		Options:     []ParameterOption{},
-		MinCount:    min,
+	c := positionalParam{
+		name:        name,
+		description: description,
+		options:     []paramOption{},
+		minCount:    min,
 	}
 
-	p.listParameter = &c
+	p.listParam = &c
 
 	return nil
 }
 
+// Subparse configures a subparser, adding a parameter that defers to a secondary parser
+// chosen by its value.
 func (p *Parser) Subparse(name string, description string, subparserMap SubparserMap) {
 	p.subparserArgument = name
 	p.subparsers = map[string]Parser{}
-	var options []ParameterOption
+	var options []paramOption
 
 	for subparserName, initSubparser := range subparserMap {
-		option := ParameterOption{
-			Name: subparserName,
+		option := paramOption{
+			name: subparserName,
 		}
 
-		if option.Name[0] == '_' {
-			option.Hidden = true
-			option.Name = option.Name[1:]
+		if option.name[0] == '_' {
+			option.hidden = true
+			option.name = option.name[1:]
 		}
 
 		subparser := NewParser()
 		initSubparser(&subparser)
-		p.subparsers[option.Name] = subparser
+		p.subparsers[option.name] = subparser
 		options = append(options, option)
 	}
 
@@ -147,9 +319,9 @@ func (p *Parser) popArg() (string, bool) {
 	return val, true
 }
 
-func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
-	values := map[string]interface{}{}
-	hasListParameterArg := p.listParameter != nil
+func (p *Parser) parseArgs(args []string) (map[string]any, []error) {
+	values := map[string]any{}
+	hasListParameterArg := p.listParam != nil
 	var listValues []string
 	currentArgPos := 0
 	var errors []error
@@ -157,12 +329,12 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 
 	// Set defaults
 
-	for _, flagConfig := range p.flagArgs {
-		values[flagConfig.LongName] = flagConfig.SetByDefault
+	for _, flagConfig := range p.flagParams {
+		values[flagConfig.longName] = flagConfig.setByDefault
 	}
 
-	for _, flagValueConfig := range p.valueFlagArgs {
-		values[flagValueConfig.LongName] = flagValueConfig.Default
+	for _, flagValueConfig := range p.valueFlagParams {
+		values[flagValueConfig.longName] = flagValueConfig.defaultValue
 	}
 
 	// Populate values
@@ -176,7 +348,7 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 
 		isLongFlag := strings.HasPrefix(arg, "--")
 		isShortFlag := strings.HasPrefix(arg, "-")
-		isParameterArg := currentArgPos < len(p.parameterArgs)
+		isParameterArg := currentArgPos < len(p.positionalParams)
 
 		if isLongFlag {
 			longName := strings.TrimPrefix(arg, "--")
@@ -186,23 +358,23 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 				values["help"] = true
 				found = true
 			} else {
-				for _, flagConfig := range p.flagArgs {
-					if flagConfig.LongName == longName {
-						values[flagConfig.LongName] = !flagConfig.SetByDefault
+				for _, flagConfig := range p.flagParams {
+					if flagConfig.longName == longName {
+						values[flagConfig.longName] = !flagConfig.setByDefault
 						found = true
 						break
 					}
 				}
 
-				for _, flagConfig := range p.valueFlagArgs {
-					if flagConfig.LongName == longName {
+				for _, flagConfig := range p.valueFlagParams {
+					if flagConfig.longName == longName {
 						flagValue, ok := p.popArg()
 
 						if !ok {
 							errors = append(errors, fmt.Errorf("missing value for flag `%s'", longName))
 						}
 
-						values[flagConfig.LongName] = flagValue
+						values[flagConfig.longName] = flagValue
 						found = true
 					}
 				}
@@ -223,23 +395,23 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 					values["help"] = true
 					found = true
 				} else {
-					for _, flagConfig := range p.flagArgs {
-						if flagConfig.ShortName == shortName {
-							values[flagConfig.LongName] = !flagConfig.SetByDefault
+					for _, flagConfig := range p.flagParams {
+						if flagConfig.shortName == shortName {
+							values[flagConfig.longName] = !flagConfig.setByDefault
 							found = true
 							break
 						}
 					}
 
-					for _, flagConfig := range p.valueFlagArgs {
-						if flagConfig.ShortName == shortName {
+					for _, flagConfig := range p.valueFlagParams {
+						if flagConfig.shortName == shortName {
 							flagValue, ok := p.popArg()
 
 							if !ok {
 								errors = append(errors, fmt.Errorf("missing value for flag `%c'", shortName))
 							}
 
-							values[flagConfig.LongName] = flagValue
+							values[flagConfig.longName] = flagValue
 							found = true
 							break
 						}
@@ -253,18 +425,18 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 
 			continue
 		} else if isParameterArg {
-			parameterConfig := p.parameterArgs[currentArgPos]
+			parameterConfig := p.positionalParams[currentArgPos]
 
 			// Kick things over to the subparser
 
-			if parameterConfig.Name == p.subparserArgument {
+			if parameterConfig.name == p.subparserArgument {
 				subparser, ok := p.subparsers[arg]
 
 				if !ok {
-					errors = append(errors, fmt.Errorf("bad argument \"%s\" for parameter `%s'", arg, parameterConfig.Name))
+					errors = append(errors, fmt.Errorf("bad argument \"%s\" for parameter `%s'", arg, parameterConfig.name))
 				}
 
-				values[parameterConfig.Name] = arg
+				values[parameterConfig.name] = arg
 				result, subparserErrors := subparser.parseArgs(p.args)
 
 				if len(subparserErrors) > 0 {
@@ -278,39 +450,36 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 				return values, errors
 			}
 
-			for _, option := range parameterConfig.Options {
-				if option.Name == arg {
-					errors = append(errors, fmt.Errorf("bad argument \"%s\" for parameter `%s'", arg, parameterConfig.Name))
+			for _, option := range parameterConfig.options {
+				if option.name == arg {
+					errors = append(errors, fmt.Errorf("bad argument \"%s\" for parameter `%s'", arg, parameterConfig.name))
 					break
 				}
 			}
 
-			values[parameterConfig.Name] = arg
+			values[parameterConfig.name] = arg
 			currentArgPos += 1
 		} else if hasListParameterArg {
 			listValues = append(listValues, arg)
 		} else {
-			errors = append(errors, fmt.Errorf("yikes"))
+			errors = append(errors, fmt.Errorf("received unexpected argument \"%s\"", arg))
 		}
 	}
 
 	// Set list parameter arg if applicable
 
 	if hasListParameterArg {
-		if len(listValues) < p.listParameter.MinCount {
-			errors = append(errors, fmt.Errorf("list parameter `%s' requires at least %d value(s)", p.listParameter.Name, p.listParameter.MinCount))
+		if len(listValues) < p.listParam.minCount {
+			errors = append(errors, fmt.Errorf("list parameter `%s' requires at least %d value(s)", p.listParam.name, p.listParam.minCount))
 		}
 
-		values[p.listParameter.Name] = listValues
+		values[p.listParam.name] = listValues
 	}
 
 	// Determine if any args are missing
 
-	var missingArgNames []string
-
-	for i := currentArgPos; i < len(p.parameterArgs); i++ {
-		missingArgNames = append(missingArgNames, p.parameterArgs[i].Name)
-		errors = append(errors, fmt.Errorf("missing required parameter `%s'", p.parameterArgs[i].Name))
+	for i := currentArgPos; i < len(p.positionalParams); i++ {
+		errors = append(errors, fmt.Errorf("missing required parameter `%s'", p.positionalParams[i].name))
 	}
 
 	for name, val := range values {
@@ -322,7 +491,7 @@ func (p *Parser) parseArgs(args []string) (map[string]interface{}, []error) {
 	return values, errors
 }
 
-func (p *Parser) ParseArgs() (map[string]interface{}, []error) {
+func (p *Parser) ParseArgs() (map[string]any, []error) {
 	osArgs := os.Args[1:]
 	args, errors := p.parseArgs(osArgs)
 
@@ -341,23 +510,10 @@ func (p *Parser) ParseArgs() (map[string]interface{}, []error) {
 	return args, errors
 }
 
-func (p *Parser) MustParseArgs() map[string]interface{} {
-	osArgs := os.Args[1:]
-	args, errs := p.parseArgs(osArgs)
+func (p *Parser) MustParseArgs() map[string]any {
+	args, errors := p.ParseArgs()
 
-	if _, ok := args["help"]; ok {
-		subparserArg, found := args[p.subparserArgument]
-
-		if found {
-			p.printUsage(subparserArg.(string))
-		} else {
-			p.printUsage("")
-		}
-
-		os.Exit(0)
-	}
-
-	if len(errs) > 0 {
+	if len(errors) > 0 {
 		subparserArg, found := args[p.subparserArgument]
 
 		if found {
@@ -368,7 +524,7 @@ func (p *Parser) MustParseArgs() map[string]interface{} {
 
 		_, _ = fmt.Fprintln(os.Stderr, "\nencountered errors when parsing arguments:")
 
-		for _, err := range errs {
+		for _, err := range errors {
 			_, _ = fmt.Fprintf(os.Stderr, " %s\n", err)
 		}
 
@@ -381,30 +537,30 @@ func (p *Parser) MustParseArgs() map[string]interface{} {
 func (p *Parser) getParamString(subparserArg string) string {
 	usage := ""
 
-	for _, valueFlagArg := range p.valueFlagArgs {
-		usage += fmt.Sprintf(" [-%c, --%s %s]", valueFlagArg.ShortName, valueFlagArg.LongName, valueFlagArg.ValueName)
+	for _, valueFlagArg := range p.valueFlagParams {
+		usage += fmt.Sprintf(" [-%c, --%s %s]", valueFlagArg.shortName, valueFlagArg.longName, valueFlagArg.valueName)
 	}
 
-	for _, flagArg := range p.flagArgs {
-		usage += fmt.Sprintf(" [-%c, --%s]", flagArg.ShortName, flagArg.LongName)
+	for _, flagArg := range p.flagParams {
+		usage += fmt.Sprintf(" [-%c, --%s]", flagArg.shortName, flagArg.longName)
 	}
 
-	for _, parameter := range p.parameterArgs {
-		if subparserArg != "" && parameter.Name == p.subparserArgument {
-			subparser, _ := p.subparsers[subparserArg]
+	for _, parameter := range p.positionalParams {
+		if subparserArg != "" && parameter.name == p.subparserArgument {
+			subparser := p.subparsers[subparserArg]
 			usage += fmt.Sprintf(" \033[3m%s\033[23m", subparserArg)
 			usage += subparser.getParamString("")
 		} else {
-			usage += fmt.Sprintf(" %s", parameter.Name)
+			usage += fmt.Sprintf(" %s", parameter.name)
 		}
 	}
 
-	if p.listParameter != nil {
-		for i := 0; i < p.listParameter.MinCount; i++ {
-			usage += fmt.Sprintf(" %s", p.listParameter.Name)
+	if p.listParam != nil {
+		for i := 0; i < p.listParam.minCount; i++ {
+			usage += fmt.Sprintf(" %s", p.listParam.name)
 		}
 
-		usage += fmt.Sprintf(" [%s...]", p.listParameter.Name)
+		usage += fmt.Sprintf(" [%s...]", p.listParam.name)
 	}
 
 	return usage
@@ -416,41 +572,44 @@ func (p *Parser) PrintUsage() {
 
 func (p *Parser) getFlagDescriptions(subparserArg string) string {
 	if subparserArg != "" {
-		subparser, _ := p.subparsers[subparserArg]
+		subparser := p.subparsers[subparserArg]
 		return subparser.getFlagDescriptions("")
 	}
 
 	usage := ""
-	var prefixes []string
-	var descriptions []string
+	prefixes := make([]string, len(p.valueFlagParams)+len(p.flagParams))
 	maxPrefixLen := 0
 
-	for _, valueFlagArg := range p.valueFlagArgs {
-		prefix := fmt.Sprintf("-%c, --%s %s", valueFlagArg.ShortName, valueFlagArg.LongName, valueFlagArg.ValueName)
+	for i, valueFlagArg := range p.valueFlagParams {
+		prefix := fmt.Sprintf("-%c, --%s %s", valueFlagArg.shortName, valueFlagArg.longName, valueFlagArg.valueName)
 		prefixLen := len(prefix)
 
 		if prefixLen > maxPrefixLen {
 			maxPrefixLen = prefixLen
 		}
 
-		prefixes = append(prefixes, prefix)
-		descriptions = append(descriptions, valueFlagArg.Description)
+		prefixes[i] = prefix
 	}
 
-	for _, flagArg := range p.flagArgs {
-		prefix := fmt.Sprintf("-%c, --%s", flagArg.ShortName, flagArg.LongName)
+	for i, flagArg := range p.flagParams {
+		prefix := fmt.Sprintf("-%c, --%s", flagArg.shortName, flagArg.longName)
 		prefixLen := len(prefix)
 
 		if prefixLen > maxPrefixLen {
 			maxPrefixLen = prefixLen
 		}
 
-		prefixes = append(prefixes, prefix)
-		descriptions = append(descriptions, flagArg.Description)
+		prefixes[i+len(p.valueFlagParams)] = prefix
 	}
 
 	for i, prefix := range prefixes {
-		usage += fmt.Sprintf("\n %s:%*c%s", prefix, maxPrefixLen-len(prefix)+1, ' ', descriptions[i])
+		usage += fmt.Sprintf("\n %s:%*c", prefix, maxPrefixLen-len(prefix)+1, ' ')
+
+		if i < len(p.valueFlagParams) {
+			usage += fmt.Sprintf("%s (default \"%s\")", p.valueFlagParams[i].description, p.valueFlagParams[i].defaultValue)
+		} else {
+			usage += p.flagParams[i-len(p.valueFlagParams)].description
+		}
 	}
 
 	return usage
@@ -458,7 +617,7 @@ func (p *Parser) getFlagDescriptions(subparserArg string) string {
 
 func (p *Parser) getParameterDescriptions(subparserArg string) string {
 	if subparserArg != "" {
-		subparser, _ := p.subparsers[subparserArg]
+		subparser := p.subparsers[subparserArg]
 		return subparser.getParameterDescriptions("")
 	}
 
@@ -467,8 +626,8 @@ func (p *Parser) getParameterDescriptions(subparserArg string) string {
 	var descriptions []string
 	maxPrefixLen := 0
 
-	for _, parameter := range p.parameterArgs {
-		prefix := parameter.Name
+	for _, parameter := range p.positionalParams {
+		prefix := parameter.name
 		prefixLen := len(prefix)
 
 		if prefixLen > maxPrefixLen {
@@ -476,17 +635,17 @@ func (p *Parser) getParameterDescriptions(subparserArg string) string {
 		}
 
 		prefixes = append(prefixes, prefix)
-		descriptions = append(descriptions, parameter.Description)
+		descriptions = append(descriptions, parameter.description)
 	}
 
-	if p.listParameter != nil {
+	if p.listParam != nil {
 		prefix := ""
 
-		for i := 0; i < p.listParameter.MinCount; i++ {
-			prefix += fmt.Sprintf(" %s", p.listParameter.Name)
+		for i := 0; i < p.listParam.minCount; i++ {
+			prefix += fmt.Sprintf(" %s", p.listParam.name)
 		}
 
-		prefix += fmt.Sprintf(" [%s...]", p.listParameter.Name)
+		prefix += fmt.Sprintf(" [%s...]", p.listParam.name)
 		prefixLen := len(prefix)
 
 		if prefixLen > maxPrefixLen {
@@ -494,7 +653,7 @@ func (p *Parser) getParameterDescriptions(subparserArg string) string {
 		}
 
 		prefixes = append(prefixes, prefix)
-		descriptions = append(descriptions, p.listParameter.Description)
+		descriptions = append(descriptions, p.listParam.description)
 	}
 
 	for i, prefix := range prefixes {
@@ -506,19 +665,19 @@ func (p *Parser) getParameterDescriptions(subparserArg string) string {
 
 func (p *Parser) getParameterOptions(subparserArg string) []string {
 	if subparserArg != "" {
-		subparser, _ := p.subparsers[subparserArg]
+		subparser := p.subparsers[subparserArg]
 		return subparser.getParameterOptions("")
 	}
 
 	var options []string
 
-	for _, parameter := range p.parameterArgs {
-		if len(parameter.Options) > 0 {
-			optionString := fmt.Sprintf("\noptions for parameter `%s':", parameter.Name)
+	for _, parameter := range p.positionalParams {
+		if len(parameter.options) > 0 {
+			optionString := fmt.Sprintf("\noptions for parameter `%s':", parameter.name)
 
-			for _, option := range parameter.Options {
-				if !option.Hidden {
-					optionString += "\n " + option.Name
+			for _, option := range parameter.options {
+				if !option.hidden {
+					optionString += "\n " + option.name
 				}
 			}
 
